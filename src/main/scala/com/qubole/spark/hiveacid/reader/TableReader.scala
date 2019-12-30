@@ -20,7 +20,7 @@
 package com.qubole.spark.hiveacid.reader
 
 import com.qubole.spark.hiveacid.ReadConf
-import com.qubole.spark.hiveacid.transaction.{HiveAcidReadTxn, HiveAcidTxnManager}
+import com.qubole.spark.hiveacid.transaction.{HiveAcidReadTxn, HiveAcidTxnManager, HiveAcidTxnStore}
 import com.qubole.spark.hiveacid.hive.{HiveAcidMetadata, HiveConverter}
 import com.qubole.spark.hiveacid.reader.hive.{HiveAcidReader, HiveAcidReaderOptions}
 import org.apache.spark.internal.Logging
@@ -33,7 +33,6 @@ private[hiveacid] class TableReader(sparkSession: SparkSession,
                                     hiveAcidMetadata: HiveAcidMetadata) extends Logging {
 
   private val hiveConf = HiveConverter.getHiveConf(sparkSession.sparkContext)
-  private val txnManager = new HiveAcidTxnManager(sparkSession, hiveConf)
 
   def getRdd(requiredColumns: Array[String],
              filters: Array[Filter],
@@ -77,7 +76,12 @@ private[hiveacid] class TableReader(sparkSession: SparkSession,
       s"hive.io.file.readcolumn.names: ${hadoopConf.get("hive.io.file.readcolumn.names")}, " +
       s"hive.io.file.readcolumn.ids: ${hadoopConf.get("hive.io.file.readcolumn.ids")}")
 
-    val txn = new HiveAcidReadTxn(hiveAcidMetadata, txnManager)
+    var txn = HiveAcidTxnStore.getCurrentTxn(sparkSession).orNull
+    if (txn == null) {
+      val txnManager = new HiveAcidTxnManager(sparkSession, hiveConf)
+      txn = new HiveAcidReadTxn(hiveAcidMetadata, txnManager)
+      txn.begin()
+    }
 
     val readerOptions = new ReaderOptions(hadoopConf,
       partitionAttributes,

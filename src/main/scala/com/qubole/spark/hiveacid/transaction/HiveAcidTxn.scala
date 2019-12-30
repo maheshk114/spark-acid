@@ -42,15 +42,20 @@ private[hiveacid] abstract class HiveAcidTxn(
   val currentWriteId: Long
 
   val validWriteIds: ValidWriteIdList
+
+  def setTxnId(id: Long, validTxnsList: String): Unit = {}
+
+  def isReadTxn: Boolean = false
+
+  def txnId: Long = -1
 }
 
-// Special Txn for transaction less operations
+// Read Transaction
 private[hiveacid] class HiveAcidReadTxn(override val hiveAcidMetadata: HiveAcidMetadata,
                                         txnManager: HiveAcidTxnManager)
-  extends HiveAcidTxn(hiveAcidMetadata, txnManager) {
+  extends HiveAcidFullTxn(hiveAcidMetadata, txnManager) {
   override lazy val currentWriteId: Long = throw HiveAcidErrors.unsupportedFunction()
-  override lazy val validWriteIds: ValidWriteIdList = txnManager.getValidWriteIds(
-    hiveAcidMetadata.fullyQualifiedName)
+  override def isReadTxn: Boolean = true
 }
 
 private[hiveacid] class HiveAcidFullTxn(override val hiveAcidMetadata: HiveAcidMetadata,
@@ -60,11 +65,15 @@ private[hiveacid] class HiveAcidFullTxn(override val hiveAcidMetadata: HiveAcidM
   private var id: Long = -1
   private var shouldAbort = false
   private val isClosed: AtomicBoolean = new AtomicBoolean(false)
+  private var txnsList: String = _
+  override def txnId: Long = id
 
-  def txnId: Long = id
-  def setTxnId(id: Long): Unit = {
+  override def setTxnId(id: Long, validTxnsList: String): Unit = {
     this.id = id
+    txnsList = validTxnsList
   }
+
+  def validTxnsList: String = txnsList
 
   override def begin(): Unit = {
     if (id != -1) {
@@ -84,7 +93,7 @@ private[hiveacid] class HiveAcidFullTxn(override val hiveAcidMetadata: HiveAcidM
       val doAbort = abort || shouldAbort
       logInfo(s"Closing transaction $txnId on table " +
         s"${hiveAcidMetadata.fullyQualifiedName}. abort = $doAbort")
-      txnManager.endTxn(txnId, doAbort)
+      txnManager.endTxn(this, doAbort)
     } else {
       throw HiveAcidErrors.txnAlreadyClosed(txnId)
     }
@@ -106,6 +115,6 @@ private[hiveacid] class HiveAcidFullTxn(override val hiveAcidMetadata: HiveAcidM
     if (id == -1) {
       throw HiveAcidErrors.tableWriteIdRequestedBeforeTxnStart(hiveAcidMetadata.fullyQualifiedName)
     }
-    txnManager.getValidWriteIds(txnId, hiveAcidMetadata.fullyQualifiedName)
+    txnManager.getValidWriteIds(txnId, validTxnsList, hiveAcidMetadata.fullyQualifiedName)
   }
 }

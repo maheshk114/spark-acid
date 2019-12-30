@@ -172,9 +172,8 @@ private[reader] class HiveAcidReader(private val sparkSession: SparkSession,
     val broadcastedHadoopConf = _broadcastedHadoopConf
     val tablePath = hiveTable.getPath
 
-    val ifcName = hiveTable.getInputFormatClass.getName
-    val ifc = Util.classForName(ifcName, loadShaded = true)
-      .asInstanceOf[java.lang.Class[InputFormat[Writable, Writable]]]
+    val ifc = Util.classForName(hiveTable.getTTable.getSd.getInputFormat, loadShaded = true).
+      asInstanceOf[java.lang.Class[InputFormat[Writable, Writable]]]
     val hiveRDD = createRddForTable(localTableDesc, hiveTable.getSd.getCols,
       hiveTable.getParameters, tablePath.toString, acquireLocks = true, ifc)
 

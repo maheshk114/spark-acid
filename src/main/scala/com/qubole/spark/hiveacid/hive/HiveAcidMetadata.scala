@@ -21,7 +21,6 @@ import java.util.Locale
 
 import scala.collection.JavaConversions._
 import scala.collection.mutable
-
 import com.qubole.shaded.hadoop.hive.conf.HiveConf
 import com.qubole.shaded.hadoop.hive.ql.io.RecordIdentifier
 import com.qubole.shaded.hadoop.hive.ql.metadata
@@ -32,7 +31,6 @@ import com.qubole.spark.hiveacid.HiveAcidErrors
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.io.Writable
 import org.apache.hadoop.mapred.{InputFormat, OutputFormat}
-
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
 import org.apache.spark.sql.types._
@@ -114,12 +112,10 @@ class HiveAcidMetadata(sparkSession: SparkSession,
   }
 
   lazy val tableDesc: TableDesc = {
-    val inputFormatClass: Class[InputFormat[Writable, Writable]] =
-      Util.classForName(hTable.getInputFormatClass.getName,
-        loadShaded = true).asInstanceOf[java.lang.Class[InputFormat[Writable, Writable]]]
-    val outputFormatClass: Class[OutputFormat[Writable, Writable]] =
-      Util.classForName(hTable.getOutputFormatClass.getName,
-        loadShaded = true).asInstanceOf[java.lang.Class[OutputFormat[Writable, Writable]]]
+    val inputFormatClass = Util.classForName(hTable.getTTable.getSd.getInputFormat, true).
+      asInstanceOf[java.lang.Class[InputFormat[Writable, Writable]]]
+    val outputFormatClass = Util.classForName(hTable.getTTable.getSd.getOutputFormat, true).
+      asInstanceOf[java.lang.Class[InputFormat[Writable, Writable]]]
     new TableDesc(
       inputFormatClass,
       outputFormatClass,

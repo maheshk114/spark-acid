@@ -27,7 +27,7 @@ import com.qubole.shaded.hadoop.hive.metastore.txn.TxnUtils
 import com.qubole.shaded.hadoop.hive.metastore.{HiveMetaStoreClient, LockComponentBuilder, LockRequestBuilder}
 import com.qubole.spark.hiveacid.datasource.HiveAcidDataSource
 import com.qubole.spark.hiveacid.hive.HiveAcidMetadata
-import com.qubole.spark.hiveacid.{HiveAcidOperation, HiveAcidErrors}
+import com.qubole.spark.hiveacid.{HiveAcidErrors, HiveAcidOperation}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import com.qubole.shaded.thrift.TException
@@ -66,7 +66,7 @@ private[hiveacid] class HiveAcidTxnManager(sparkSession: SparkSession,
 
   private val user: String = sparkSession.sparkContext.sparkUser
 
-  private val activeTxns = new scala.collection.mutable.HashMap[Long, HiveAcidFullTxn]()
+  private val activeTxns = new scala.collection.mutable.HashMap[Long, HiveAcidTxn]()
 
   private var shutdownInitiated = false
 
@@ -79,16 +79,31 @@ private[hiveacid] class HiveAcidTxnManager(sparkSession: SparkSession,
     * @param txn transaction which needs to begin.
     * @return Update transaction object
     */
-  def beginTxn(txn: HiveAcidFullTxn): HiveAcidFullTxn = synchronized {
-    // 1. Open transaction
-    val txnId = client.openTxn(HiveAcidDataSource.NAME)
-    if (activeTxns.contains(txnId)) {
-      throw HiveAcidErrors.repeatedTxnId(txnId, activeTxns.keySet.toSeq)
+  def beginTxn(txn: HiveAcidTxn): HiveAcidTxn = synchronized {
+    try {
+      val txnId = client.openTxn(HiveAcidDataSource.NAME)
+      if (activeTxns.contains(txnId)) {
+        throw HiveAcidErrors.repeatedTxnId(txnId, activeTxns.keySet.toSeq)
+      }
+      txn.setTxnId(txnId, client.getValidTxns(txnId).writeToString())
+      activeTxns.put(txnId, txn)
+      if (txn.isReadTxn) {
+        // For read transaction, if a read transaction is already started in the spark session, then subsequent
+        // operations in the same session uses existing transaction. So need to provide hooks for committing the
+        // session transaction.
+        // 1. During query end. This will be used if application is using data frame apis.
+        // 2. During application end, if application is using rdd apis.
+        // 3. By application, using HiveAcidTxnStore.endTxn. If user wants to get a new snapshot.
+        sparkSession.sparkContext.addSparkListener(new SparkAcidListener(this))
+        sparkSession.listenerManager.register(new SparkAcidQueryListener(this))
+        HiveAcidTxnStore.addCurrentTxn(sparkSession, txn)
+      }
+      logInfo("Opened txnid: " + txnId + " for table " + txn.hiveAcidMetadata.fullyQualifiedName)
+      txn
+    } catch {
+      case ise: Throwable => endTxn(txn, abort = true)
+      throw ise
     }
-    txn.setTxnId(txnId)
-    activeTxns.put(txnId, txn)
-    logInfo("Opened txnid: " + txnId + " for table " + txn.hiveAcidMetadata.fullyQualifiedName)
-    txn
   }
 
   /**
@@ -96,10 +111,11 @@ private[hiveacid] class HiveAcidTxnManager(sparkSession: SparkSession,
     * @param txnId id of transaction to be end
     * @param abort true if transaction is to be aborted.
     */
-  def endTxn(txnId: Long, abort: Boolean = false): Unit = synchronized {
+  def endTxn(txn: HiveAcidTxn, abort: Boolean = false): Unit = synchronized {
+    val txnId : Long = txn.txnId
     try {
       if (abort) {
-        client.abortTxns(Seq(txnId).asInstanceOf[java.util.List[java.lang.Long]])
+        client.rollbackTxn(txnId)
       } else {
         client.commitTxn(txnId)
       }
@@ -108,7 +124,14 @@ private[hiveacid] class HiveAcidTxnManager(sparkSession: SparkSession,
         logWarning(s"Failure to end txn: $txnId, presumed abort", e)
     } finally {
       activeTxns.remove(txnId)
+      if (txn.isReadTxn) {
+        HiveAcidTxnStore.removeCurrentTxn(sparkSession)
+      }
     }
+  }
+
+  def currentTxn() : Option[HiveAcidTxn] = {
+    HiveAcidTxnStore.getCurrentTxn(sparkSession)
   }
 
   /**
@@ -181,6 +204,13 @@ private[hiveacid] class HiveAcidTxnManager(sparkSession: SparkSession,
       validTxns.writeToString())
     val txnWriteIds: ValidTxnWriteIdList = TxnUtils.createValidTxnWriteIdList(txnId,
       tableValidWriteIds)
+    txnWriteIds.getTableValidWriteIdList(fullyQualifiedTableName)
+  }
+
+  def getValidWriteIds(txnId: Long, validTxns: String,
+                       fullyQualifiedTableName: String): ValidWriteIdList = synchronized {
+    val tableValidWriteIds = client.getValidWriteIds(Seq(fullyQualifiedTableName), validTxns)
+    val txnWriteIds: ValidTxnWriteIdList = TxnUtils.createValidTxnWriteIdList(txnId, tableValidWriteIds)
     txnWriteIds.getTableValidWriteIdList(fullyQualifiedTableName)
   }
 
@@ -277,7 +307,7 @@ private[hiveacid] class HiveAcidTxnManager(sparkSession: SparkSession,
   }
 
   private class HeartbeatRunnable() extends Runnable {
-    private def send(txn: HiveAcidFullTxn): Unit = {
+    private def send(txn: HiveAcidTxn): Unit = {
       try {
         // Does not matter if txn is already ended
         val resp = heartBeaterClient.heartbeatTxnRange(txn.txnId, txn.txnId)
@@ -308,5 +338,27 @@ private[hiveacid] class HiveAcidTxnManager(sparkSession: SparkSession,
 
   class HeartBeaterThread(val target: Runnable, val name: String) extends Thread(target, name) {
     setDaemon(true)
+  }
+}
+
+object HiveAcidTxnStore {
+  private val sessionTxnMap = new scala.collection.mutable.HashMap[SparkSession, HiveAcidTxn]()
+  def endTxn(sparkSession: SparkSession, abort: Boolean = false): Unit = {
+    val txn: HiveAcidTxn = getCurrentTxn(sparkSession).orNull
+    if (txn != null) {
+      txn.end(abort)
+    }
+  }
+
+  def getCurrentTxn(sparkSession: SparkSession): Option[HiveAcidTxn] = synchronized {
+    sessionTxnMap.get(sparkSession)
+  }
+
+  private[transaction]def addCurrentTxn (sparkSession: SparkSession, txn: HiveAcidTxn): Unit = synchronized {
+    sessionTxnMap.put(sparkSession, txn)
+  }
+
+  private[transaction]def removeCurrentTxn(sparkSession: SparkSession): Unit = synchronized {
+    sessionTxnMap.remove(sparkSession)
   }
 }

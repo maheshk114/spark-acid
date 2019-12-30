@@ -48,7 +48,6 @@ private[hiveacid] class HiveAcidUnionRDD[T: ClassTag](
   override def getPartitions: Array[Partition] = {
     // Initialize the ACID state here to get the write-ids to read
     // Start transaction
-    txn.begin()
     txn.acquireLocks(HiveAcidOperation.READ, partitionList)
     super.getPartitions
   }
