@@ -23,12 +23,15 @@ import com.qubole.spark.hiveacid.{HiveAcidOperation, SparkAcidConf}
 import com.qubole.spark.hiveacid.transaction._
 import com.qubole.spark.hiveacid.hive.HiveAcidMetadata
 import com.qubole.spark.hiveacid.reader.hive.{HiveAcidReader, HiveAcidReaderOptions}
+import com.qubole.spark.hiveacid.SparkAcidConf
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.sources.Filter
+import org.apache.spark.sql.sources.v2.reader.InputPartition
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /**
   * Table reader object
@@ -41,9 +44,9 @@ private[hiveacid] class TableReader(sparkSession: SparkSession,
                                     curTxn: HiveAcidTxn,
                                     hiveAcidMetadata: HiveAcidMetadata) extends Logging {
 
-  def getRdd(requiredColumns: Array[String],
+  def getTableReader(requiredColumns: Array[String],
              filters: Array[Filter],
-             readConf: SparkAcidConf): RDD[Row] = {
+             readConf: SparkAcidConf): HiveAcidReader = {
     val rowIdColumnSet = HiveAcidMetadata.rowIdSchema.fields.map(_.name).toSet
     val requiredColumnsWithoutRowId = requiredColumns.filterNot(rowIdColumnSet.contains)
     val partitionColumnNames = hiveAcidMetadata.partitionSchema.fields.map(_.name)
@@ -111,19 +114,34 @@ private[hiveacid] class TableReader(sparkSession: SparkSession,
     // Create Snapshot !!!
     val curSnapshot = HiveAcidTxn.createSnapshot(curTxn, hiveAcidMetadata)
 
-    val reader = new HiveAcidReader(
+    new HiveAcidReader(
       sparkSession,
       readerOptions,
       hiveAcidReaderOptions,
-      curSnapshot.validWriteIdList)
+      curSnapshot.validWriteIdList,
+      partitions)
+  }
 
+  def getReader(requiredColumns: Array[String],
+                filters: Array[Filter],
+                readConf: SparkAcidConf): java.util.List[InputPartition[ColumnarBatch]] = {
+    val reader = getTableReader(requiredColumns, filters, readConf)
+    if (hiveAcidMetadata.isPartitioned) {
+      reader.makeReaderForPartitionedTable(hiveAcidMetadata)
+    } else {
+      reader.makeV2ReaderForTable(hiveAcidMetadata)
+    }
+  }
+
+  def getRdd(requiredColumns: Array[String],
+             filters: Array[Filter],
+             readConf: SparkAcidConf): RDD[Row] = {
+    val reader = getTableReader(requiredColumns, filters, readConf)
     val rdd = if (hiveAcidMetadata.isPartitioned) {
-      reader.makeRDDForPartitionedTable(hiveAcidMetadata, partitions)
+      reader.makeRDDForPartitionedTable(hiveAcidMetadata)
     } else {
       reader.makeRDDForTable(hiveAcidMetadata)
     }
-
-
     rdd.asInstanceOf[RDD[Row]]
   }
 }

@@ -20,7 +20,7 @@
 package com.qubole.spark.hiveacid.reader.hive
 
 import java.util
-import java.util.Properties
+import java.util.{List, Properties}
 
 import scala.collection.JavaConverters._
 import com.esotericsoftware.kryo.Kryo
@@ -43,6 +43,7 @@ import com.qubole.spark.hiveacid.hive.HiveConverter
 import com.qubole.spark.hiveacid.reader.{Reader, ReaderOptions, ReaderPartition}
 import com.qubole.spark.hiveacid.rdd._
 import com.qubole.spark.hiveacid.util._
+import com.qubole.spark.hiveacid.reader.v2.HiveAcidInputPartitionV2
 import org.apache.commons.codec.binary.Base64
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{Path, PathFilter}
@@ -64,6 +65,9 @@ import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.sql.hive.{Hive3Inspectors, HiveAcidUtils}
 import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.sql.sources.v2.reader.InputPartition
+import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.sql.types._
 
 /**
  * Helper class for scanning tables stored in Hadoop - e.g., to read
@@ -72,11 +76,13 @@ import org.apache.spark.unsafe.types.UTF8String
  * @param readerOptions - reader options for creating RDD
  * @param hiveAcidOptions - hive related reader options for creating RDD
  * @param validWriteIds - validWriteIds
+ * @param partitions - The list of partitions to be scanned. Valid only for partitioned table.
  */
 private[reader] class HiveAcidReader(sparkSession: SparkSession,
                                      readerOptions: ReaderOptions,
                                      hiveAcidOptions: HiveAcidReaderOptions,
-                                     validWriteIds: ValidWriteIdList)
+                                     validWriteIds: ValidWriteIdList,
+                                     partitions: Seq[ReaderPartition])
 
 extends CastSupport with Reader with Logging {
 
@@ -95,14 +101,46 @@ extends CastSupport with Reader with Logging {
 
   override def conf: SQLConf = sparkSession.sessionState.conf
 
-  /**
-   * @param hiveAcidMetadata - hive acid metadata for underlying table
-   * @return - Returns RDD on top of non partitioned hive acid table and list of partitionNames empty list
-    *         for entire table
-   */
-  def makeRDDForTable(hiveAcidMetadata: HiveAcidMetadata): RDD[InternalRow] = {
-    val hiveTable = hiveAcidMetadata.hTable
+  def makeV2ReaderForPath(hiveAcidMetadata: HiveAcidMetadata,
+                          path : String,
+                          fieldSchemas: util.List[FieldSchema],
+                          partitionValues : InternalRow): java.util.List[InputPartition[ColumnarBatch]] = {
+    setReaderOptions(hiveAcidMetadata)
 
+    val ifcName = hiveAcidMetadata.hTable.getInputFormatClass.getName
+    val ifc = Util.classForName(ifcName, loadShaded = true)
+      .asInstanceOf[java.lang.Class[InputFormat[Writable, Writable]]]
+
+    val colNames = getColumnNamesFromFieldSchema(fieldSchemas)
+    val colTypes = getColumnTypesFromFieldSchema(fieldSchemas)
+    val initializeJobConfFunc = HiveAcidReader.initializeLocalJobConfFunc(
+      path, hiveAcidOptions.tableDesc,
+      hiveAcidMetadata.hTable.getParameters,
+      colNames, colTypes) _
+    val jobConf = HiveAcidCommon.getJobConf(_broadcastedHadoopConf.value.value,
+      "test", shouldCloneJobConf = true, Some(initializeJobConfFunc))
+
+    val partitionArray = new java.util.ArrayList[InputPartition[ColumnarBatch]]
+    val inputSplits  = HiveAcidCommon.getInputSplits(jobConf, validWriteIds,
+      /*validTxnList,*/ ifc, hiveAcidMetadata.isFullAcidTable)
+    val reqFileds = hiveAcidMetadata.tableSchema.fields.filter(field =>
+      readerOptions.requiredNonPartitionedColumns.contains(field.name))
+    for (i <- 0 until inputSplits.size) {
+      partitionArray.add(new HiveAcidInputPartitionV2(inputSplits(i),
+        sparkSession.sparkContext.broadcast(new SerializableConfiguration(jobConf)),
+        partitionValues, reqFileds, hiveAcidMetadata.partitionSchema))
+      logInfo("getPartitions : Input split: " + inputSplits(i))
+    }
+    partitionArray
+  }
+
+  def makeV2ReaderForTable(hiveAcidMetadata: HiveAcidMetadata): java.util.List[InputPartition[ColumnarBatch]] = {
+    makeV2ReaderForPath(hiveAcidMetadata, hiveAcidMetadata.hTable.getPath.toString,
+                      hiveAcidMetadata.hTable.getSd.getCols,
+                      new SpecificInternalRow(hiveAcidMetadata.partitionSchema))
+  }
+
+  private def setReaderOptions(hiveAcidMetadata: HiveAcidMetadata) : Unit = {
     // Push Down Predicate
     if (readerOptions.readConf.predicatePushdownEnabled) {
       setPushDownFiltersInHadoopConf(readerOptions.hadoopConf,
@@ -121,9 +159,17 @@ extends CastSupport with Reader with Logging {
       s"${readerOptions.hadoopConf.get("hive.io.file.readcolumn.names")}, " +
       s"hive.io.file.readcolumn.ids: " +
       s"${readerOptions.hadoopConf.get("hive.io.file.readcolumn.ids")}")
+  }
 
+  /**
+   * @param hiveAcidMetadata - hive acid metadata for underlying table
+   * @return - Returns RDD on top of non partitioned hive acid table and list of partitionNames empty list
+   *         for entire table
+   */
+  def makeRDDForTable(hiveAcidMetadata: HiveAcidMetadata): RDD[InternalRow] = {
+      setReaderOptions(hiveAcidMetadata)
     makeRDDForTable(
-      hiveTable,
+      hiveAcidMetadata.hTable,
       Util.classForName(hiveAcidOptions.tableDesc.getSerdeClassName,
         loadShaded = true).asInstanceOf[Class[Deserializer]],
       hiveAcidMetadata,
@@ -133,12 +179,10 @@ extends CastSupport with Reader with Logging {
 
   /**
    * @param hiveAcidMetadata - hive acid metadata of underlying table
-   * @param partitions - partitions for the table
    *
    * @return - Returns RDD on top of partitioned hive acid table
    */
-  def makeRDDForPartitionedTable(hiveAcidMetadata: HiveAcidMetadata,
-                                 partitions: Seq[ReaderPartition]): RDD[InternalRow] = {
+  def makeRDDForPartitionedTable(hiveAcidMetadata: HiveAcidMetadata): RDD[InternalRow] = {
 
     val partitionToDeserializer = partitions.map(p => p.ptn.asInstanceOf[HiveJarPartition]).map {
       part =>
@@ -148,6 +192,91 @@ extends CastSupport with Reader with Logging {
         (part, deserializer)
     }.toMap
     makeRDDForPartitionedTable(partitionToDeserializer, filterOpt = None, readerOptions)
+  }
+
+  private def getV2ParrtitionReader(ifc : Class[InputFormat[Writable, Writable]],
+                                    path: String,
+                                    parameters: util.Map[String, String],
+                                    colNames: String,
+                                    colTypes: String,
+                                    isFullAcidTable : Boolean,
+                                    partVals : InternalRow,
+                                    requiredFields: Array[StructField],
+                                    partitionSchema : StructType) :
+  java.util.ArrayList[InputPartition[ColumnarBatch]] = {
+
+    val initializeJobConfFunc = HiveAcidReader.initializeLocalJobConfFunc(
+      path, hiveAcidOptions.tableDesc,
+      parameters,
+      colNames, colTypes) _
+    val jobConf = HiveAcidCommon.getJobConf(readerOptions.hadoopConf,
+      "test", shouldCloneJobConf = true, Some(initializeJobConfFunc))
+
+    val partitionArray = new java.util.ArrayList[InputPartition[ColumnarBatch]]
+    val inputSplits  = HiveAcidCommon.getInputSplits(jobConf, validWriteIds,
+      /*validTxnList,*/ ifc, isFullAcidTable)
+    for (i <- 0 until inputSplits.size) {
+      partitionArray.add(new HiveAcidInputPartitionV2(inputSplits(i),
+        sparkSession.sparkContext.broadcast(new SerializableConfiguration(jobConf)),
+        partVals, requiredFields, partitionSchema))
+      logInfo("getPartitions : Input split: " + inputSplits(i))
+    }
+    partitionArray
+  }
+
+  def makeReaderForPartitionedTable(hiveAcidMetadata: HiveAcidMetadata):
+  java.util.ArrayList[InputPartition[ColumnarBatch]] = {
+    val partitionToDeserializer = getPartitionToDeserializer(partitions)
+    val partitionArray = new java.util.ArrayList[InputPartition[ColumnarBatch]]
+    val partList = partitionToDeserializer.map { case (partition, partDeserializer) =>
+      val partPath = partition.getDataLocation
+      val inputPathStr = applyFilterIfNeeded(partPath, None)
+      val partSpec = partition.getSpec
+      val partCols = partition.getTable.getPartitionKeys.asScala.map(_.getName)
+
+      // 'partValues[i]' contains the value for the partitioning column at 'partCols[i]'.
+      val partValues = if (partSpec == null) {
+        Array.fill(partCols.size)(new String)
+      } else {
+        partCols.map(col => new String(partSpec.get(col))).toArray
+      }
+
+      val mutableRow = new SpecificInternalRow(hiveAcidMetadata.partitionSchema)
+
+      // Splits all attributes into two groups, partition key attributes and those
+      // that are not. Attached indices indicate the position of each attribute in
+      // the output schema.
+      val (partitionKeyAttrs, nonPartitionKeyAttrs) =
+      readerOptions.requiredAttributes.zipWithIndex.partition { case (attr, _) =>
+        readerOptions.partitionAttributes.contains(attr)
+      }
+
+      def fillPartitionKeys(rawPartValues: Array[String], row: InternalRow): Unit = {
+        var offset = 0
+        partitionKeyAttrs.foreach { case (attr, ordinal) =>
+          val partOrdinal = readerOptions.partitionAttributes.indexOf(attr)
+          row(offset) = cast(
+            Literal(rawPartValues(partOrdinal)), attr.dataType).eval(null)
+          offset = offset + 1
+        }
+      }
+      fillPartitionKeys(partValues, mutableRow)
+
+      makeV2ReaderForPath(hiveAcidMetadata, inputPathStr,  partition.getTPartition.getSd.getCols, mutableRow)
+    }
+    for (list <- partList) partitionArray.addAll(list)
+    partitionArray
+  }
+
+  private def getPartitionToDeserializer(partitions: Seq[ReaderPartition])
+  : Map[HiveJarPartition, Class[_ <: Deserializer]] = {
+    partitions.map(p => p.ptn.asInstanceOf[HiveJarPartition]).map {
+      part =>
+        val deserializerClassName = part.getTPartition.getSd.getSerdeInfo.getSerializationLib
+        val deserializer = Util.classForName(deserializerClassName, loadShaded = true)
+          .asInstanceOf[Class[Deserializer]]
+        (part, deserializer)
+    }.toMap
   }
 
   /**
@@ -397,6 +526,9 @@ extends CastSupport with Reader with Logging {
     conf.set(ColumnProjectionUtils.READ_ALL_COLUMNS, "false")
     conf.set(ColumnProjectionUtils.READ_COLUMN_NAMES_CONF_STR, sortedNames.mkString(","))
     conf.set(ColumnProjectionUtils.READ_COLUMN_IDS_CONF_STR, sortedIDs.mkString(","))
+    /*val schema : TypeDescription = acidTableMetadata.dataSchema.fields.filter(
+                    fld => requiredColumns.contains(fld.name)).addField(_name, _type)
+    conf.set("orc.mapred.input.schema", schema.toString)*/
   }
 
   private def setPushDownFiltersInHadoopConf(conf: Configuration,
@@ -417,7 +549,7 @@ extends CastSupport with Reader with Logging {
   }
 }
 
-private[reader] object HiveAcidReader extends Hive3Inspectors with Logging {
+private[hiveacid] object HiveAcidReader extends Hive3Inspectors with Logging {
 
   def getPartitions(hiveAcidMetadata: HiveAcidMetadata,
                     readerOptions: ReaderOptions,
@@ -531,8 +663,10 @@ private[reader] object HiveAcidReader extends Hive3Inspectors with Logging {
     }
     val bufferSize = System.getProperty("spark.buffer.size", "65536")
     jobConf.set("io.file.buffer.size", bufferSize)
-    jobConf.set("schema.evolution.columns", schemaColNames)
-    jobConf.set("schema.evolution.columns.types", schemaColTypes)
+    if (schemaColNames != null) {
+      jobConf.set("schema.evolution.columns", schemaColNames)
+      jobConf.set("schema.evolution.columns.types", schemaColTypes)
+    }
 
     // Set HiveACID related properties in jobConf
     val isTransactionalTable = AcidUtils.isTransactionalTable(tableParameters)
