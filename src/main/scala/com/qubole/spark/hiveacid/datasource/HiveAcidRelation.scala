@@ -33,6 +33,8 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 
 import collection.JavaConversions._
 
+import org.apache.commons.lang3.exception.ExceptionUtils
+
 /**
   * Container for all metadata, configuration and schema to perform operations on
   * Hive ACID datasource. This provides for plumbing most of the heavy lifting is

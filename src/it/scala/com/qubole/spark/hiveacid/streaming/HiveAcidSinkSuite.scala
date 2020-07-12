@@ -27,7 +27,11 @@ import com.qubole.spark.hiveacid.datasource.HiveAcidDataSource
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.streaming.OutputMode
 
+import org.scalatest._
 
+import scala.util.control.NonFatal
+
+@Ignore
 class HiveAcidSinkSuite extends HiveAcidStreamingFunSuite {
 
   override protected def afterAll(): Unit = {

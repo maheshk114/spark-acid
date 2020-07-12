@@ -30,8 +30,7 @@ import scala.reflect.ClassTag
 import com.qubole.shaded.hadoop.hive.common.ValidWriteIdList
 import com.qubole.shaded.hadoop.hive.ql.io.{AcidInputFormat, AcidUtils, HiveInputFormat, RecordIdentifier}
 import com.qubole.spark.hiveacid.rdd.HiveAcidRDD.HiveAcidPartitionsWithSplitRDD
-import com.qubole.spark.hiveacid.util.{SerializableConfiguration, Util}
-import com.qubole.spark.hiveacid.util.{SerializableWritable => _}
+import com.qubole.spark.hiveacid.util.{HiveAcidCommon, SerializableConfiguration, Util, SerializableWritable => _}
 import org.apache.hadoop.conf.{Configurable, Configuration}
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapred.{FileInputFormat, _}
@@ -136,117 +135,12 @@ private[hiveacid] class HiveAcidRDD[K, V](sc: SparkContext,
   // Returns a JobConf that will be used on slaves to obtain input splits for Hadoop reads.
   protected def getJobConf: JobConf = {
     val conf: Configuration = broadcastedConf.value.value
-    if (shouldCloneJobConf) {
-      // Hadoop Configuration objects are not thread-safe, which may lead to various problems if
-      // one job modifies a configuration while another reads it (SPARK-2546).  This problem occurs
-      // somewhat rarely because most jobs treat the configuration as though it's immutable.  One
-      // solution, implemented here, is to clone the Configuration object.  Unfortunately, this
-      // clone can be very expensive.  To avoid unexpected performance regressions for workloads and
-      // Hadoop versions that do not suffer from these thread-safety issues, this cloning is
-      // disabled by default.
-      HiveAcidRDD.CONFIGURATION_INSTANTIATION_LOCK.synchronized {
-        logDebug("Cloning Hadoop Configuration")
-        val newJobConf = new JobConf(conf)
-        if (!conf.isInstanceOf[JobConf]) {
-          initLocalJobConfFuncOpt.foreach(f => f(newJobConf))
-        }
-        newJobConf
-      }
-    } else {
-      conf match {
-        case c: JobConf =>
-          logDebug("Re-using user-broadcasted JobConf")
-          c
-        case _ =>
-          Option(HiveAcidRDD.getCachedMetadata(jobConfCacheKey))
-            .map { conf =>
-              logDebug("Re-using cached JobConf")
-              conf.asInstanceOf[JobConf]
-            }
-            .getOrElse {
-              // Create a JobConf that will be cached and used across this RDD's getJobConf() calls in
-              // the local process. The local cache is accessed through HiveAcidRDD.putCachedMetadata().
-              // The caching helps minimize GC, since a JobConf can contain ~10KB of temporary
-              // objects. Synchronize to prevent ConcurrentModificationException (SPARK-1097,
-              // HADOOP-10456).
-              HiveAcidRDD.CONFIGURATION_INSTANTIATION_LOCK.synchronized {
-                logDebug("Creating new JobConf and caching it for later re-use")
-                val newJobConf = new JobConf(conf)
-                initLocalJobConfFuncOpt.foreach(f => f(newJobConf))
-                HiveAcidRDD.putCachedMetadata(jobConfCacheKey, newJobConf)
-                newJobConf
-              }
-            }
-      }
-    }
-  }
-
-  protected def getInputFormat(conf: JobConf): InputFormat[K, V] = {
-    val newInputFormat = ReflectionUtils.newInstance(inputFormatClass.asInstanceOf[Class[_]], conf)
-      .asInstanceOf[InputFormat[K, V]]
-    newInputFormat match {
-      case c: Configurable => c.setConf(conf)
-      case _ =>
-    }
-    newInputFormat
+    HiveAcidCommon.getJobConf(conf, jobConfCacheKey, shouldCloneJobConf, initLocalJobConfFuncOpt)
   }
 
   override def getPartitions: Array[Partition] = {
-    var jobConf = getJobConf
-
-    if (isFullAcidTable) {
-      // If full ACID table, just set the right writeIds, the
-      // OrcInputFormat.getSplits() will take care of the rest
-      AcidUtils.setValidWriteIdList(jobConf, validWriteIds)
-    } else {
-      val finalPaths = new ListBuffer[Path]()
-      val pathsWithFileOriginals = new ListBuffer[Path]()
-      val dirs = FileInputFormat.getInputPaths(jobConf).toSeq // Seq(acidState.location)
-      HiveInputFormat.processPathsForMmRead(dirs, jobConf, validWriteIds,
-        finalPaths, pathsWithFileOriginals)
-
-      if (finalPaths.nonEmpty) {
-        FileInputFormat.setInputPaths(jobConf, finalPaths.toList: _*)
-        // Need recursive to be set to true because MM Tables can have a directory structure like:
-        // ~/warehouse/hello_mm/base_0000034/HIVE_UNION_SUBDIR_1/000000_0
-        // ~/warehouse/hello_mm/base_0000034/HIVE_UNION_SUBDIR_2/000000_0
-        // ~/warehouse/hello_mm/delta_0000033_0000033_0001/HIVE_UNION_SUBDIR_1/000000_0
-        // ~/warehouse/hello_mm/delta_0000033_0000033_0002/HIVE_UNION_SUBDIR_2/000000_0
-        // ... which is created on UNION ALL operations
-        jobConf.setBoolean(FileInputFormat.INPUT_DIR_RECURSIVE, true)
-      }
-
-      if (pathsWithFileOriginals.nonEmpty) {
-        // We are going to add splits for these directories with recursive = false, so we ignore
-        // any subdirectories (deltas or original directories) and only read the original files.
-        // The fact that there's a loop calling addSplitsForGroup already implies it's ok to
-        // the real input format multiple times... however some split concurrency/etc configs
-        // that are applied separately in each call will effectively be ignored for such splits.
-        jobConf = HiveInputFormat.createConfForMmOriginalsSplit(jobConf, pathsWithFileOriginals)
-      }
-
-    }
-    // add the credentials here as this can be called before SparkContext initialized
-    SparkHadoopUtil.get.addCredentials(jobConf)
-    try {
-      val allInputSplits = getInputFormat(jobConf).getSplits(jobConf, minPartitions)
-      val inputSplits = if (ignoreEmptySplits) {
-        allInputSplits.filter(_.getLength > 0)
-      } else {
-        allInputSplits
-      }
-      val array = new Array[Partition](inputSplits.size)
-      for (i <- 0 until inputSplits.size) {
-        array(i) = new HiveAcidPartition(id, i, inputSplits(i))
-      }
-      array
-    } catch {
-      case e: InvalidInputException if ignoreMissingFiles =>
-        val inputDir = jobConf.get(org.apache.hadoop.mapreduce.lib.input.FileInputFormat.INPUT_DIR)
-        logWarning(s"$inputDir doesn't exist and no" +
-          s" partitions returned from this path.", e)
-        Array.empty[Partition]
-    }
+    HiveAcidCommon.getInputSplits(getJobConf, validWriteIds, id,
+      isFullAcidTable, inputFormatClass, minPartitions, ignoreEmptySplits, ignoreMissingFiles)
   }
 
   override def compute(theSplit: Partition,
@@ -258,7 +152,7 @@ private[hiveacid] class HiveAcidRDD[K, V](sc: SparkContext,
       val jobConf: JobConf = getJobConf
 
       private var reader: RecordReader[K, V] = _
-      private val inputFormat = getInputFormat(jobConf)
+      private val inputFormat = HiveAcidCommon.getInputFormat(jobConf, inputFormatClass)
       HiveAcidRDD.addLocalConfiguration(
         new SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(createTime),
         context.stageId, theSplit.index, context.attemptNumber, jobConf)
@@ -387,14 +281,6 @@ object HiveAcidRDD extends Logging {
 
   /** Update the input bytes read metric each time this number of records has been read */
   val RECORDS_BETWEEN_BYTES_READ_METRIC_UPDATES = 256
-
-  def getCachedMetadata(key: String): Any = {
-    Cache.jobConf.get(key)
-  }
-
-  private def putCachedMetadata(key: String, value: Any): Unit = {
-    Cache.jobConf.put(key, value)
-  }
 
   /** Add Hadoop configuration specific to a single partition and attempt. */
   def addLocalConfiguration(jobTrackerId: String, jobId: Int, splitId: Int, attemptId: Int,

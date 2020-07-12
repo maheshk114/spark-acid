@@ -22,9 +22,11 @@ import com.qubole.spark.hiveacid.transaction.HiveAcidTxn
 import org.apache.log4j.{Level, LogManager, Logger}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach, FunSuite}
+import org.scalatest._
 
 import scala.util.control.NonFatal
 
+@Ignore
 class LockSuite extends FunSuite with BeforeAndAfterEach with BeforeAndAfterAll {
   val log: Logger = LogManager.getLogger(this.getClass)
   log.setLevel(Level.INFO)
@@ -174,7 +176,7 @@ class LockSuite extends FunSuite with BeforeAndAfterEach with BeforeAndAfterAll 
 class TestLockHelper extends TestHelper {
   // Create spark session with txn timeout config as that needs to be set
   // before the start of spark session
-  override def getSparkSession(): SparkSession = {
+  override def getSparkSession(isDSV2: String): SparkSession = {
     SparkSession.builder().appName("Hive-acid-test")
       .master("local[*]")
       .config("spark.hadoop.hive.metastore.uris", "thrift://0.0.0.0:10000")
@@ -183,6 +185,7 @@ class TestLockHelper extends TestHelper {
       .config("spark.hadoop.hive.txn.timeout", "6")
       //.config("spark.ui.enabled", "true")
       //.config("spark.ui.port", "4041")
+      .config("spark.acid.use.datasource.v2", isDSV2)
       .enableHiveSupport()
       .getOrCreate()
   }

@@ -24,7 +24,11 @@ import org.apache.log4j.{Level, LogManager, Logger}
 import org.scalatest._
 
 import scala.util.control.NonFatal
+import org.scalatest._
 
+import scala.util.control.NonFatal
+
+@Ignore
 class UpdateDeleteSuite extends FunSuite with BeforeAndAfterEach with BeforeAndAfterAll {
 
   val log: Logger = LogManager.getLogger(this.getClass)

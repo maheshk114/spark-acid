@@ -54,7 +54,11 @@ case class HiveAcidAutoConvert(spark: SparkSession) extends Rule[LogicalPlan] {
 
   private def convertV2(relation: HiveTableRelation): LogicalPlan = {
     val serde = relation.tableMeta.storage.serde.getOrElse("").toLowerCase(Locale.ROOT)
-    if (!serde.equals("org.apache.hadoop.hive.ql.io.orc.orcserde")) return convert(relation)
+    if (!serde.equals("org.apache.hadoop.hive.ql.io.orc.orcserde")) {
+      // Only ORC formatted is supported as of now. If its not ORC, then fallback to
+      // datasource V1.
+      return convert(relation)
+    }
     val dbName = relation.tableMeta.identifier.database.getOrElse("default")
     val tableName = relation.tableMeta.identifier.table
     val tableOpts = Map("database" -> dbName, "table" -> tableName)
@@ -71,11 +75,11 @@ case class HiveAcidAutoConvert(spark: SparkSession) extends Rule[LogicalPlan] {
       // Read path
       case relation: HiveTableRelation
         if DDLUtils.isHiveTable(relation.tableMeta) && isConvertible(relation) =>
-          //if (spark.conf.get("spark.acid.use.datasource.v2", "false").toBoolean) {
+          if (spark.conf.get("spark.acid.use.datasource.v2", "false").toBoolean) {
             convertV2(relation)
-          //} else {
-            //convert(relation)
-          //}
+          } else {
+            convert(relation)
+          }
     }
   }
 }

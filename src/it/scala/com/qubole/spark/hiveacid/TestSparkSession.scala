@@ -22,7 +22,7 @@ import org.apache.spark.sql.SparkSession
 
 private[hiveacid] object TestSparkSession {
 
-  def getSession: SparkSession = {
+  def getSession(isDSV2 : String = "false"): SparkSession = {
     val spark: SparkSession = SparkSession.builder().appName("Hive-acid-test")
       .master("local[*]")
       .config("spark.hadoop.hive.metastore.uris", "thrift://0.0.0.0:10000")
@@ -30,6 +30,7 @@ private[hiveacid] object TestSparkSession {
       .config("spark.sql.extensions", "com.qubole.spark.hiveacid.HiveAcidAutoConvertExtension")
       //.config("spark.ui.enabled", "true")
       //.config("spark.ui.port", "4041")
+      .config("spark.acid.use.datasource.v2", isDSV2)
       .enableHiveSupport()
       .getOrCreate()
     spark.sparkContext.setLogLevel("WARN")

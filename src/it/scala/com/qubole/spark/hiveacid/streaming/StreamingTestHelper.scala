@@ -30,7 +30,11 @@ import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.streaming.{OutputMode, StreamingQuery}
 import org.scalatest.concurrent.TimeLimits
 import org.scalatest.time.SpanSugar
+import org.scalatest._
 
+import scala.util.control.NonFatal
+
+@Ignore
 class StreamingTestHelper extends TestHelper with TimeLimits  {
 
   import StreamingTestHelper._

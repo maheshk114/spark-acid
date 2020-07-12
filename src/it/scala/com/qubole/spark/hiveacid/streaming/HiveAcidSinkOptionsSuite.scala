@@ -5,7 +5,11 @@ import java.util.Locale
 import com.qubole.spark.hiveacid.Table
 import org.apache.spark.sql.streaming.OutputMode
 
+import org.scalatest._
 
+import scala.util.control.NonFatal
+
+@Ignore
 class HiveAcidSinkOptionsSuite extends HiveAcidStreamingFunSuite {
 
   import HiveAcidSinkOptions._

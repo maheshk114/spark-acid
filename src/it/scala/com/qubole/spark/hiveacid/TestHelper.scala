@@ -40,10 +40,10 @@ class TestHelper extends SQLImplicits {
   implicit override def _sqlContext: SQLContext = spark.sqlContext
 
 
-  def init(isDebug: Boolean) {
+  def init(isDebug: Boolean, isDSV2: String = "false") {
     verbose = isDebug
     // Clients
-    spark = getSparkSession()
+    spark = getSparkSession(isDSV2)
     if (verbose) {
       log.setLevel(Level.DEBUG)
     }
@@ -52,8 +52,16 @@ class TestHelper extends SQLImplicits {
 
   // this function can be overridden by the derived classes
   // to create their own Spark Session for test
-  protected def getSparkSession(): SparkSession = {
-    TestSparkSession.getSession
+  protected def getSparkSession(isDSV2: String): SparkSession = {
+    TestSparkSession.getSession(isDSV2)
+  }
+
+  def getDSVersion() : String = {
+    if (spark.conf.get("spark.acid.use.datasource.v2", "false").toBoolean) {
+      "DS_V2"
+    } else {
+      "DS_V1"
+    }
   }
 
   def destroy(): Unit = {
@@ -77,8 +85,9 @@ class TestHelper extends SQLImplicits {
     log.info(s"Verify simple $msg")
     val hiveResStr = hiveExecuteQuery(table.hiveSelect)
     val (dfFromSql, dfFromScala) = sparkGetDF(table)
-    compareResult(hiveResStr, dfFromSql.collect())
+
     compareResult(hiveResStr, dfFromScala.collect())
+    compareResult(hiveResStr, dfFromSql.collect())
   }
 
   // With Predicate
@@ -86,16 +95,18 @@ class TestHelper extends SQLImplicits {
     log.info(s"Verify with predicate $msg")
     val hiveResStr = hiveExecuteQuery(table.hiveSelectWithPred(pred))
     val (dfFromSql, dfFromScala) = sparkGetDFWithPred(table, pred)
-    compareResult(hiveResStr, dfFromSql.collect())
+
     compareResult(hiveResStr, dfFromScala.collect())
+    compareResult(hiveResStr, dfFromSql.collect())
   }
   // With Projection
   private def compareWithProj(table: Table, msg: String): Unit = {
     log.info(s"Verify with projection $msg")
     val hiveResStr = hiveExecuteQuery(table.hiveSelectWithProj)
     val (dfFromSql, dfFromScala) = sparkGetDFWithProj(table)
-    compareResult(hiveResStr, dfFromSql.collect())
+
     compareResult(hiveResStr, dfFromScala.collect())
+    compareResult(hiveResStr, dfFromSql.collect())
   }
 
   // Compare result of 2 tables via hive
@@ -199,7 +210,7 @@ class TestHelper extends SQLImplicits {
   }
 
   def sparkGetDFWithProj(table: Table): (DataFrame, DataFrame) = {
-    val dfSql = sparkSQL(table.sparkSelect)
+    val dfSql = sparkSQL(table.hiveSelect)
 
     var dfScala = spark.read.format("HiveAcid").options(Map("table" -> table.hiveTname)).load().select(table.sparkDFProj)
     dfScala = totalOrderBy(table, dfScala)
@@ -207,7 +218,7 @@ class TestHelper extends SQLImplicits {
   }
 
   def sparkGetDFWithPred(table: Table, pred: String): (DataFrame, DataFrame) = {
-    val dfSql = sparkSQL(table.sparkSelectWithPred(pred))
+    val dfSql = sparkSQL(table.hiveSelectWithPred(pred))
 
     var dfScala = spark.read.format("HiveAcid").options(Map("table" -> table.hiveTname)).load().where(col("intCol") < "5")
     dfScala = totalOrderBy(table, dfScala)
@@ -215,7 +226,7 @@ class TestHelper extends SQLImplicits {
   }
 
   def sparkGetDF(table: Table): (DataFrame, DataFrame) = {
-    val dfSql = sparkSQL(table.sparkSelect)
+    val dfSql = sparkSQL(table.hiveSelect)
 
     var dfScala = spark.read.format("HiveAcid").options(Map("table" -> table.hiveTname)).load()
     dfScala = totalOrderBy(table, dfScala)

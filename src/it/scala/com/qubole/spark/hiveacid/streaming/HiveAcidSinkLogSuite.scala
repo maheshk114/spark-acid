@@ -24,7 +24,11 @@ import java.nio.charset.StandardCharsets.UTF_8
 
 import org.apache.spark.sql.execution.streaming.CompactibleFileStreamLog
 
+import org.scalatest._
 
+import scala.util.control.NonFatal
+
+@Ignore
 class HiveAcidSinkLogSuite extends HiveAcidStreamingFunSuite  {
 
   import CompactibleFileStreamLog._

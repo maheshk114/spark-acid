@@ -21,8 +21,6 @@ package com.qubole.spark.hiveacid.datasource
 
 import java.util.{ArrayList, List, Map}
 import org.apache.spark.sql.sources.v2.reader.DataSourceReader
-import com.qubole.shaded.hadoop.hive.metastore.HiveMetaStoreClient
-import org.apache.spark.sql.sources.v2.reader.DataSourceReader
 import org.apache.spark.internal.Logging
 import com.qubole.spark.hiveacid.HiveAcidDataSourceV2Reader
 import org.apache.spark.sql.SparkSession
@@ -30,6 +28,7 @@ import org.apache.spark.sql.sources.v2.{ReadSupport,DataSourceOptions,DataSource
 
 class HiveAcidDataSourceV2 extends DataSourceV2 with ReadSupport with Logging {
   override def  createReader (options: DataSourceOptions) : DataSourceReader = {
+    logInfo("Using Datasource V2 for table" + options.tableName.get)
     new HiveAcidDataSourceV2Reader(options.asMap,
                                   SparkSession.getActiveSession.orNull,
                                   options.databaseName.get, options.tableName.get)
@@ -39,6 +38,3 @@ class HiveAcidDataSourceV2 extends DataSourceV2 with ReadSupport with Logging {
     "HiveAcidV2"
   }
 }
-
-
-

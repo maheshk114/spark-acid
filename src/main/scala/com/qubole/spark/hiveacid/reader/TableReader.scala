@@ -76,7 +76,7 @@ private[hiveacid] class TableReader(sparkSession: SparkSession,
     // Filters
     val (partitionFilters, otherFilters) = filters.partition { predicate =>
       !predicate.references.isEmpty &&
-        predicate.references.toSet.subsetOf(partitionedColumnSet)
+        predicate.references.map(_.toLowerCase).toSet.subsetOf(partitionedColumnSet)
     }
     val dataFilters = otherFilters.filter(_
       .references.intersect(partitionColumnNames).isEmpty
@@ -127,8 +127,10 @@ private[hiveacid] class TableReader(sparkSession: SparkSession,
                 readConf: SparkAcidConf): java.util.List[InputPartition[ColumnarBatch]] = {
     val reader = getTableReader(requiredColumns, filters, readConf)
     if (hiveAcidMetadata.isPartitioned) {
+      logWarning("Mahesh getReader for Partitioned table")
       reader.makeReaderForPartitionedTable(hiveAcidMetadata)
     } else {
+      logWarning("Mahesh getReader for non Partitioned table ")
       reader.makeV2ReaderForTable(hiveAcidMetadata)
     }
   }
@@ -138,8 +140,10 @@ private[hiveacid] class TableReader(sparkSession: SparkSession,
              readConf: SparkAcidConf): RDD[Row] = {
     val reader = getTableReader(requiredColumns, filters, readConf)
     val rdd = if (hiveAcidMetadata.isPartitioned) {
+      logWarning("Mahesh getRdd for table Partitioned")
       reader.makeRDDForPartitionedTable(hiveAcidMetadata)
     } else {
+      logWarning("Mahesh getRdd for non Partitioned table ")
       reader.makeRDDForTable(hiveAcidMetadata)
     }
     rdd.asInstanceOf[RDD[Row]]

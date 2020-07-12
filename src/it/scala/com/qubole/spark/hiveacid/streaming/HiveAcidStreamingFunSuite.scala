@@ -25,7 +25,11 @@ import org.scalatest.{BeforeAndAfterAll, FunSuite}
 
 import scala.util.control.NonFatal
 
+import org.scalatest._
 
+import scala.util.control.NonFatal
+
+@Ignore
 abstract class HiveAcidStreamingFunSuite extends FunSuite with BeforeAndAfterAll {
 
   protected val log: Logger = LogManager.getLogger(this.getClass)

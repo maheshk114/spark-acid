@@ -1,7 +1,7 @@
 package com.qubole.spark.hiveacid.reader.v2
 
 import com.qubole.spark.hiveacid.rdd.HiveAcidPartition
-import com.qubole.spark.hiveacid.util.{HiveAcidCommon, SerializableConfiguration}
+import com.qubole.spark.hiveacid.util.{SerializableConfiguration}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.sources.v2.reader.InputPartition
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -16,8 +16,9 @@ private[hiveacid] class HiveAcidInputPartitionV2(split: HiveAcidPartition,
                                                  broadcastedConf: Broadcast[SerializableConfiguration],
                                                  partitionValues : InternalRow,
                                                  requiredFields: Array[StructField],
-                                                 partitionSchema : StructType)
-                  extends InputPartition[ColumnarBatch] /*with Logging*/ {
+                                                 partitionSchema : StructType,
+                                                 isFullAcidTable: Boolean)
+                  extends InputPartition[ColumnarBatch] {
   override def preferredLocations: Array[String] = {
     try split.inputSplit.value.getLocations
     catch {
@@ -28,6 +29,7 @@ private[hiveacid] class HiveAcidInputPartitionV2(split: HiveAcidPartition,
   }
 
   override def createPartitionReader: InputPartitionReader[ColumnarBatch] = {
-    new HiveAcidInputPartitionReaderV2(split, broadcastedConf, partitionValues, requiredFields, partitionSchema)
+    new HiveAcidInputPartitionReaderV2(split, broadcastedConf, partitionValues,
+      requiredFields, partitionSchema, isFullAcidTable)
   }
 }

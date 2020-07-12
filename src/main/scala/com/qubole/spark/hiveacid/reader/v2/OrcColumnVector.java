@@ -49,22 +49,6 @@ public class OrcColumnVector extends org.apache.spark.sql.vectorized.ColumnVecto
 
   private int batchSize;
 
-  public static DataType getSparkOrcType(ColumnVector vector) {
-    if (vector instanceof LongColumnVector) {
-      return new LongType();
-    } else if (vector instanceof DoubleColumnVector) {
-      return new DoubleType();
-    } else if (vector instanceof BytesColumnVector) {
-      return new ByteType();
-    } else if (vector instanceof DecimalColumnVector) {
-      return new DecimalType();
-    } else if (vector instanceof TimestampColumnVector) {
-      return new TimestampType();
-    } else {
-      throw new UnsupportedOperationException();
-    }
-  }
-
   OrcColumnVector(DataType type, ColumnVector vector) {
     super(type);
 

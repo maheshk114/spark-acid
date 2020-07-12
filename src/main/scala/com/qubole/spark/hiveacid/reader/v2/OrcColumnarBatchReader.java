@@ -17,9 +17,11 @@
 
 package com.qubole.spark.hiveacid.reader.v2;
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.List;
 import java.util.stream.IntStream;
 
+import com.qubole.spark.hiveacid.util.HiveAcidCommon;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.hadoop.mapreduce.RecordReader;
@@ -42,7 +44,6 @@ import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.io.NullWritable;
 
-import org.apache.spark.memory.MemoryMode;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.execution.vectorized.ColumnVectorUtils;
 import org.apache.spark.sql.execution.vectorized.OffHeapColumnVector;
@@ -50,7 +51,7 @@ import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
-
+import com.qubole.shaded.hadoop.hive.ql.io.sarg.*;
 
 /**
  * To support vectorization in WholeStageCodeGen, this reader returns ColumnarBatch.
@@ -73,7 +74,7 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
   // Record reader from ORC row batch.
   private com.qubole.shaded.orc.RecordReader baseRecordReader;
 
-  private VectorizedOrcAcidRowBatchReader recordReader;
+  private VectorizedOrcAcidRowBatchReader fullAcidRecordReader;
 
   private StructField[] requiredFields;
 
@@ -86,24 +87,15 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
   // The wrapped ORC column vectors. It should be null if `copyToSpark` is true.
   private org.apache.spark.sql.vectorized.ColumnVector[] orcVectorWrappers;
 
-  // The memory mode of the columnarBatch
-  private final MemoryMode MEMORY_MODE;
-
-  // Whether or not to copy the ORC columnar batch to Spark columnar batch.
-  private final boolean copyToSpark;
-
-  private Reader readerInner;
-
   private OrcSplit fileSplit;
 
   private Configuration conf;
 
-  public OrcColumnarBatchReader(boolean useOffHeap, boolean copyToSpark, int capacity) {
-    MEMORY_MODE = useOffHeap ? MemoryMode.OFF_HEAP : MemoryMode.ON_HEAP;
-    this.copyToSpark = copyToSpark;
+  private int rootCol;
+
+  public OrcColumnarBatchReader(int capacity) {
     this.capacity = capacity;
   }
-
 
   @Override
   public Void getCurrentKey() {
@@ -117,7 +109,7 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
 
   @Override
   public float getProgress() throws IOException {
-    return recordReader.getProgress();
+    return fullAcidRecordReader.getProgress();
   }
 
   @Override
@@ -131,10 +123,70 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
       columnarBatch.close();
       columnarBatch = null;
     }
-    if (recordReader != null) {
-      recordReader.close();
-      recordReader = null;
+    if (fullAcidRecordReader != null) {
+      fullAcidRecordReader.close();
+      fullAcidRecordReader = null;
     }
+    if (baseRecordReader != null) {
+      baseRecordReader.close();
+      baseRecordReader = null;
+    }
+  }
+
+  private String[] getSargColumnNames(String[] originalColumnNames,
+                                      List<com.qubole.shaded.orc.OrcProto.Type> types,
+                                      boolean[] includedColumns, boolean isOriginal) {
+    String[] columnNames = new String[types.size() - rootCol];
+    int i = 0;
+    Iterator var7 = ((com.qubole.shaded.orc.OrcProto.Type)types.get(rootCol)).getSubtypesList().iterator();
+
+    while(true) {
+      int columnId;
+      do {
+        if (!var7.hasNext()) {
+          return columnNames;
+        }
+
+        columnId = (Integer)var7.next();
+      } while(includedColumns != null && !includedColumns[columnId - rootCol]);
+
+      columnNames[columnId - rootCol] = originalColumnNames[i++];
+    }
+  }
+
+  private void setSearchArgument(Reader.Options options, List<com.qubole.shaded.orc.OrcProto.Type> types, Configuration conf) {
+    String neededColumnNames = conf.get("hive.io.file.readcolumn.names");
+    if (neededColumnNames == null) {
+      //LOG.debug("No ORC pushdown predicate - no column names");
+      options.searchArgument((SearchArgument)null, (String[])null);
+    } else {
+      SearchArgument sarg = com.qubole.shaded.hadoop.hive.ql.io.sarg.ConvertAstToSearchArg.createFromConf(conf);
+      if (sarg == null) {
+        //LOG.debug("No ORC pushdown predicate");
+        options.searchArgument((SearchArgument)null, (String[])null);
+      } else {
+        //if (LOG.isInfoEnabled()) {
+         // LOG.info("ORC pushdown predicate: " + sarg);
+       // }
+
+        options.searchArgument(sarg,
+                getSargColumnNames(neededColumnNames.split(","), types, options.getInclude(), true));
+      }
+    }
+  }
+
+  private Reader.Options setSearchArgumentForOption(Configuration conf,
+                                                TypeDescription readerSchema,
+                                                    Reader.Options readerOptions) throws IOException {
+    //Reader.Options readerOptions = new Reader.Options(conf).schema(readerSchema);
+    // TODO: Convert genIncludedColumns and setSearchArgument to use TypeDescription.
+    final List<com.qubole.shaded.orc.OrcProto.Type> schemaTypes =
+            com.qubole.shaded.orc.OrcUtils.getOrcTypes(readerSchema);
+    //readerOptions.include(com.qubole.shaded.hadoop.hive.ql.io.orc.OrcInputFormat.genIncludedColumns(readerSchema,
+           // com.qubole.shaded.hadoop.hive.serde2.ColumnProjectionUtils.getReadColumnIDs(conf)));
+    //todo: last param is bogus. why is this hardcoded?
+    setSearchArgument(readerOptions, schemaTypes, conf);
+    return readerOptions;
   }
 
   /**
@@ -142,18 +194,10 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
    * Please note that `initBatch` is needed to be called after this.
    */
   @Override
-  public void initialize(
-          InputSplit inputSplit, TaskAttemptContext taskAttemptContext) throws IOException {
+  public void initialize(InputSplit inputSplit,
+                         TaskAttemptContext taskAttemptContext) throws IOException {
     fileSplit = (OrcSplit)inputSplit;
     conf = taskAttemptContext.getConfiguration();
-    readerInner = OrcFile.createReader(
-            fileSplit.getPath(),
-            OrcFile.readerOptions(conf)
-                    .maxLength(OrcConf.MAX_FILE_LENGTH.getLong(conf))
-                    .filesystem(fileSplit.getPath().getFileSystem(conf)));
-    Reader.Options options =
-            OrcInputFormat.buildOptions(conf, readerInner, fileSplit.getStart(), fileSplit.getLength());
-    baseRecordReader = readerInner.rows(options);
   }
 
   private VectorizedOrcAcidRowBatchReader initHiveAcidReader(Configuration conf, OrcSplit orcSplit,
@@ -161,7 +205,6 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
     conf.set("hive.vectorized.execution.enabled", "true");
     MapWork mapWork = new MapWork();
     VectorizedRowBatchCtx rbCtx = new VectorizedRowBatchCtx();
-    //rbCtx.init(createStructObjectInspector(conf), new String[0]);
     mapWork.setVectorMode(true);
     mapWork.setVectorizedRowBatchCtx(rbCtx);
     Utilities.setMapWork(conf, mapWork);
@@ -216,7 +259,27 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
           int[] requestedColIds,
           StructField[] requiredFields,
           StructType partitionSchema,
-          InternalRow partitionValues) {
+          InternalRow partitionValues,
+          boolean isFullAcidTable) throws IOException {
+
+    if (!isFullAcidTable) {
+      //rootCol = org.apache.hadoop.hive.ql.io.orc.OrcInputFormat.getRootColumn(true);
+      rootCol = 0;
+    } else {
+      //rootCol = org.apache.hadoop.hive.ql.io.orc.OrcInputFormat.getRootColumn(false) - 1;
+      // In ORC, for full ACID table, the first 5 fields stores the transaction metadata.
+      rootCol = 5;
+    }
+
+    Reader readerInner = OrcFile.createReader(
+            fileSplit.getPath(), OrcFile.readerOptions(conf)
+                    .maxLength(OrcConf.MAX_FILE_LENGTH.getLong(conf))
+                    .filesystem(fileSplit.getPath().getFileSystem(conf)));
+    Reader.Options options = /*createOptionsForReader(conf, orcSchema);*/
+            OrcInputFormat.buildOptions(conf, readerInner, fileSplit.getStart(), fileSplit.getLength());
+    setSearchArgumentForOption(conf, orcSchema, options);
+    baseRecordReader = readerInner.rows(options);
+
     batch = orcSchema.createRowBatch(capacity);
     assert(!batch.selectedInUse); // `selectedInUse` should be initialized with `false`.
 
@@ -229,12 +292,20 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
       resultSchema = resultSchema.add(f);
     }
 
-    if (copyToSpark) {
-      if (MEMORY_MODE == MemoryMode.OFF_HEAP) {
+    ColumnVector[] fields;
+    orcVectorWrappers = new org.apache.spark.sql.vectorized.ColumnVector[resultSchema.length()];
+    if (rootCol == 0) {
+      fields  = batch.cols;
+    } else {
+      fields  = ((StructColumnVector)batch.cols[rootCol]).fields;
+    }
+
+    if (isFullAcidTable) {
+      /*if (MEMORY_MODE == MemoryMode.OFF_HEAP) {
         columnVectors = OffHeapColumnVector.allocateColumns(capacity, resultSchema);
-      } else {
+      } else {*/
         columnVectors = OnHeapColumnVector.allocateColumns(capacity, resultSchema);
-      }
+      //}
 
       // Initialize the missing columns once.
       for (int i = 0; i < requiredFields.length; i++) {
@@ -251,39 +322,40 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
           columnVectors[i + partitionIdx].setIsConstant();
         }
       }
+    }
 
-      columnarBatch = new ColumnarBatch(columnVectors);
+    // Just wrap the ORC column vector instead of copying it to Spark column vector.
+    orcVectorWrappers = new org.apache.spark.sql.vectorized.ColumnVector[resultSchema.length()];
+    //StructColumnVector dataCols  = (StructColumnVector)batch.cols[5];
+    for (int i = 0; i < requiredFields.length; i++) {
+      DataType dt = requiredFields[i].dataType();
+      int colId = requestedColIds[i];
+      // Initialize the missing columns once.
+      if (colId == -1) {
+        OnHeapColumnVector missingCol = new OnHeapColumnVector(capacity, dt);
+        missingCol.putNulls(0, capacity);
+        missingCol.setIsConstant();
+        orcVectorWrappers[i] = missingCol;
+      } else {
+        orcVectorWrappers[i] = new OrcColumnVector(dt, fields[colId]);
+      }
+    }
+
+    if (partitionValues.numFields() > 0) {
+      int partitionIdx = requiredFields.length;
+      for (int i = 0; i < partitionValues.numFields(); i++) {
+        DataType dt = partitionSchema.fields()[i].dataType();
+        OnHeapColumnVector partitionCol = new OnHeapColumnVector(capacity, dt);
+        ColumnVectorUtils.populate(partitionCol, partitionValues, i);
+        partitionCol.setIsConstant();
+        orcVectorWrappers[partitionIdx + i] = partitionCol;
+      }
+    }
+
+    if (isFullAcidTable) {
+      fullAcidRecordReader = initHiveAcidReader(conf, fileSplit, baseRecordReader);
     } else {
-      // Just wrap the ORC column vector instead of copying it to Spark column vector.
-      orcVectorWrappers = new org.apache.spark.sql.vectorized.ColumnVector[resultSchema.length()];
-      StructColumnVector dataCols  = (StructColumnVector)batch.cols[5];
-      for (int i = 0; i < requiredFields.length; i++) {
-        DataType dt = requiredFields[i].dataType();
-        int colId = requestedColIds[i];
-        // Initialize the missing columns once.
-        if (colId == -1) {
-          OnHeapColumnVector missingCol = new OnHeapColumnVector(capacity, dt);
-          missingCol.putNulls(0, capacity);
-          missingCol.setIsConstant();
-          orcVectorWrappers[i] = missingCol;
-        } else {
-          orcVectorWrappers[i] = new OrcColumnVector(dt, dataCols.fields[colId]);
-        }
-      }
-
-      if (partitionValues.numFields() > 0) {
-        int partitionIdx = requiredFields.length;
-        for (int i = 0; i < partitionValues.numFields(); i++) {
-          DataType dt = partitionSchema.fields()[i].dataType();
-          OnHeapColumnVector partitionCol = new OnHeapColumnVector(capacity, dt);
-          ColumnVectorUtils.populate(partitionCol, partitionValues, i);
-          partitionCol.setIsConstant();
-          orcVectorWrappers[partitionIdx + i] = partitionCol;
-        }
-      }
-
-      columnarBatch = new ColumnarBatch(orcVectorWrappers);
-      recordReader = initHiveAcidReader(conf, fileSplit, baseRecordReader);
+      fullAcidRecordReader = null;
     }
   }
 
@@ -292,20 +364,26 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
    * by copying from ORC VectorizedRowBatch columns to Spark ColumnarBatch columns.
    */
   private boolean nextBatch() throws IOException {
-    recordReader.next(NullWritable.get(), batch);
+    if (fullAcidRecordReader != null) {
+      fullAcidRecordReader.next(NullWritable.get(), batch);
+    } else {
+      baseRecordReader.nextBatch(batch);
+    }
+
     //recordReader.nextBatch(batch);
     int batchSize = batch.size;
     if (batchSize == 0) {
       return false;
     }
-    columnarBatch.setNumRows(batchSize);
 
-    if (!copyToSpark) {
+    if (!batch.selectedInUse) {
       for (int i = 0; i < requiredFields.length; i++) {
         if (requestedColIds[i] != -1) {
           ((OrcColumnVector) orcVectorWrappers[i]).setBatchSize(batchSize);
         }
       }
+      columnarBatch = new ColumnarBatch(orcVectorWrappers);
+      columnarBatch.setNumRows(batchSize);
       return true;
     }
 
@@ -313,7 +391,7 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
       vector.reset();
     }
 
-    StructColumnVector dataCols  = (StructColumnVector)batch.cols[5];
+    StructColumnVector dataCols  = (StructColumnVector)batch.cols[rootCol];
     for (int i = 0; i < requiredFields.length; i++) {
       StructField field = requiredFields[i];
       WritableColumnVector toColumn = columnVectors[i];
@@ -324,12 +402,14 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
         if (fromColumn.isRepeating) {
           putRepeatingValues(batchSize, field, fromColumn, toColumn);
         } else if (fromColumn.noNulls) {
-          putNonNullValues(batchSize, field, fromColumn, toColumn);
+          putNonNullValues(batchSize, field, fromColumn, toColumn, batch.selected);
         } else {
-          putValues(batchSize, field, fromColumn, toColumn);
+          putValues(batchSize, field, fromColumn, toColumn, batch.selected);
         }
       }
     }
+    columnarBatch = new ColumnarBatch(columnVectors);
+    columnarBatch.setNumRows(batchSize);
     return true;
   }
 
@@ -385,50 +465,69 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
           int batchSize,
           StructField field,
           ColumnVector fromColumn,
-          WritableColumnVector toColumn) {
+          WritableColumnVector toColumn,
+          int[] selected) {
     DataType type = field.dataType();
     if (type instanceof BooleanType) {
       long[] data = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        toColumn.putBoolean(index, data[index] == 1);
+        int logicalIdx = selected[index];
+        toColumn.putBoolean(index, data[logicalIdx] == 1);
       }
     } else if (type instanceof ByteType) {
       long[] data = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        toColumn.putByte(index, (byte)data[index]);
+        int logicalIdx = selected[index];
+        toColumn.putByte(index, (byte)data[logicalIdx]);
       }
     } else if (type instanceof ShortType) {
       long[] data = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        toColumn.putShort(index, (short)data[index]);
+        int logicalIdx = selected[index];
+        toColumn.putShort(index, (short)data[logicalIdx]);
       }
     } else if (type instanceof IntegerType || type instanceof DateType) {
       long[] data = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        toColumn.putInt(index, (int)data[index]);
+        int logicalIdx = selected[index];
+        toColumn.putInt(index, (int)data[logicalIdx]);
       }
     } else if (type instanceof LongType) {
-      toColumn.putLongs(0, batchSize, ((LongColumnVector)fromColumn).vector, 0);
+      long[] data = ((LongColumnVector)fromColumn).vector;
+      for (int index = 0; index < batchSize; index++) {
+        int logicalIdx = selected[index];
+        toColumn.putLong(index, data[logicalIdx]);
+      }
+      //toColumn.putLongs(0, batchSize, ((LongColumnVector)fromColumn).vector, 0);
     } else if (type instanceof TimestampType) {
       TimestampColumnVector data = ((TimestampColumnVector)fromColumn);
       for (int index = 0; index < batchSize; index++) {
-        toColumn.putLong(index, fromTimestampColumnVector(data, index));
+        int logicalIdx = selected[index];
+        toColumn.putLong(index, fromTimestampColumnVector(data, logicalIdx));
       }
     } else if (type instanceof FloatType) {
       double[] data = ((DoubleColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        toColumn.putFloat(index, (float)data[index]);
+        int logicalIdx = selected[index];
+        toColumn.putFloat(index, (float)data[logicalIdx]);
       }
     } else if (type instanceof DoubleType) {
-      toColumn.putDoubles(0, batchSize, ((DoubleColumnVector)fromColumn).vector, 0);
+      //toColumn.putDoubles(0, batchSize, ((DoubleColumnVector)fromColumn).vector, 0);
+      double[] data = ((DoubleColumnVector)fromColumn).vector;
+      for (int index = 0; index < batchSize; index++) {
+        int logicalIdx = selected[index];
+        toColumn.putDouble(index, data[logicalIdx]);
+      }
     } else if (type instanceof StringType || type instanceof BinaryType) {
       BytesColumnVector data = ((BytesColumnVector)fromColumn);
       WritableColumnVector arrayData = toColumn.arrayData();
       int totalNumBytes = IntStream.of(data.length).sum();
       arrayData.reserve(totalNumBytes);
-      for (int index = 0, pos = 0; index < batchSize; pos += data.length[index], index++) {
-        arrayData.putBytes(pos, data.length[index], data.vector[index], data.start[index]);
-        toColumn.putArray(index, pos, data.length[index]);
+      for (int index = 0, pos = 0; index < batchSize; index++) {
+        int logicalIdx = selected[index];
+        arrayData.putBytes(pos, data.length[logicalIdx], data.vector[logicalIdx], data.start[logicalIdx]);
+        toColumn.putArray(index, pos, data.length[logicalIdx]);
+        pos += data.length[logicalIdx];
       }
     } else if (type instanceof DecimalType) {
       DecimalType decimalType = (DecimalType)type;
@@ -437,12 +536,13 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
         toColumn.arrayData().reserve(batchSize * 16);
       }
       for (int index = 0; index < batchSize; index++) {
+        int logicalIdx = selected[index];
         putDecimalWritable(
                 toColumn,
                 index,
                 decimalType.precision(),
                 decimalType.scale(),
-                data.vector[index]);
+                data.vector[logicalIdx]);
       }
     } else {
       throw new UnsupportedOperationException("Unsupported Data Type: " + type);
@@ -453,78 +553,87 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
           int batchSize,
           StructField field,
           ColumnVector fromColumn,
-          WritableColumnVector toColumn) {
+          WritableColumnVector toColumn,
+          int[] selected) {
     DataType type = field.dataType();
     if (type instanceof BooleanType) {
       long[] vector = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putBoolean(index, vector[index] == 1);
+          toColumn.putBoolean(index, vector[logicalIdx] == 1);
         }
       }
     } else if (type instanceof ByteType) {
       long[] vector = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putByte(index, (byte)vector[index]);
+          toColumn.putByte(index, (byte)vector[logicalIdx]);
         }
       }
     } else if (type instanceof ShortType) {
       long[] vector = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putShort(index, (short)vector[index]);
+          toColumn.putShort(index, (short)vector[logicalIdx]);
         }
       }
     } else if (type instanceof IntegerType || type instanceof DateType) {
       long[] vector = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putInt(index, (int)vector[index]);
+          toColumn.putInt(index, (int)vector[logicalIdx]);
         }
       }
     } else if (type instanceof LongType) {
       long[] vector = ((LongColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putLong(index, vector[index]);
+          toColumn.putLong(index, vector[logicalIdx]);
         }
       }
     } else if (type instanceof TimestampType) {
       TimestampColumnVector vector = ((TimestampColumnVector)fromColumn);
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putLong(index, fromTimestampColumnVector(vector, index));
+          toColumn.putLong(index, fromTimestampColumnVector(vector, logicalIdx));
         }
       }
     } else if (type instanceof FloatType) {
       double[] vector = ((DoubleColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putFloat(index, (float)vector[index]);
+          toColumn.putFloat(index, (float)vector[logicalIdx]);
         }
       }
     } else if (type instanceof DoubleType) {
       double[] vector = ((DoubleColumnVector)fromColumn).vector;
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          toColumn.putDouble(index, vector[index]);
+          toColumn.putDouble(index, vector[logicalIdx]);
         }
       }
     } else if (type instanceof StringType || type instanceof BinaryType) {
@@ -533,11 +642,12 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
       int totalNumBytes = IntStream.of(vector.length).sum();
       arrayData.reserve(totalNumBytes);
       for (int index = 0, pos = 0; index < batchSize; pos += vector.length[index], index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
-          arrayData.putBytes(pos, vector.length[index], vector.vector[index], vector.start[index]);
-          toColumn.putArray(index, pos, vector.length[index]);
+          arrayData.putBytes(pos, vector.length[logicalIdx], vector.vector[logicalIdx], vector.start[logicalIdx]);
+          toColumn.putArray(index, pos, vector.length[logicalIdx]);
         }
       }
     } else if (type instanceof DecimalType) {
@@ -547,7 +657,8 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
         toColumn.arrayData().reserve(batchSize * 16);
       }
       for (int index = 0; index < batchSize; index++) {
-        if (fromColumn.isNull[index]) {
+        int logicalIdx = selected[index];
+        if (fromColumn.isNull[logicalIdx]) {
           toColumn.putNull(index);
         } else {
           putDecimalWritable(
@@ -555,7 +666,7 @@ public class OrcColumnarBatchReader extends RecordReader<Void, ColumnarBatch> {
                   index,
                   decimalType.precision(),
                   decimalType.scale(),
-                  vector[index]);
+                  vector[logicalIdx]);
         }
       }
     } else {
